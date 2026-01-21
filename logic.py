@@ -108,7 +108,7 @@ def get_weeks_from_text(text):
 
     # Regulärer Ausdruck, um Woche + Ort zu erfassen
     pattern = re.compile(
-        r"((?:Monday|Tuesday|Wednesday|Thursday|Friday), \d{1,2} \w+ 2025 - (?:Monday|Tuesday|Wednesday|Thursday|Friday), \d{1,2} \w+ 2025)\n(Strasbourg|Brussels)"
+        r"((?:Monday|Tuesday|Wednesday|Thursday|Friday), \d{1,2} \w+ \d{4} - (?:Monday|Tuesday|Wednesday|Thursday|Friday), \d{1,2} \w+ \d{4})\n(Strasbourg|Brussels)"
     )
 
     # Alle passenden Tupel extrahieren: (Woche, Ort)
@@ -139,7 +139,7 @@ def tage_ausgeben(ausgewaehlte_woche, text):
     print("Suche nach Woche:", text)
     # Muster: finde den Textabschnitt für die ausgewählte Woche + Ort
     pattern = re.compile(
-        re.escape(ausgewaehlte_woche) + r"\n(Strasbourg|Brussels)\n(.*?)(?=\n(?:Monday|Tuesday|Wednesday|Thursday|Friday), \d{1,2} \w+ 2025 -|$)",
+        re.escape(ausgewaehlte_woche) + r"\n(Strasbourg|Brussels)\n(.*?)(?=\n(?:Monday|Tuesday|Wednesday|Thursday|Friday), \d{1,2} \w+ \d{4} -|$)",
         re.DOTALL
     )
 
@@ -149,10 +149,10 @@ def tage_ausgeben(ausgewaehlte_woche, text):
         wocheninhalt = match.group(2)  # Textblock dieser Woche
 
         # Alle Einzeltage mit Datum (z.B. "Thursday, 13 March 2025") finden
-        tage = re.findall(r"(Monday|Tuesday|Wednesday|Thursday|Friday), \d{1,2} \w+ 2025", wocheninhalt)
+        tage = re.findall(r"(Monday|Tuesday|Wednesday|Thursday|Friday), \d{1,2} \w+ \d{4}", wocheninhalt)
         
         # Das vorherige findall gibt nur die Wochentage zurück, wir ändern die Regex:
-        tage_mit_datum = re.findall(r"(?:Monday|Tuesday|Wednesday|Thursday|Friday), \d{1,2} \w+ 2025", wocheninhalt)
+        tage_mit_datum = re.findall(r"(?:Monday|Tuesday|Wednesday|Thursday|Friday), \d{1,2} \w+ \d{4}", wocheninhalt)
 
         return tage_mit_datum
     else:
@@ -595,16 +595,6 @@ def wrap_text(text, font, max_width, draw):
 
     return lines
 
-def load_small_logo():
-    logo_path = os.path.join(BASE_DIR, "logos", "GreensEFA.png")
-    logo = Image.open(logo_path).convert("RGBA")
-    # Optional: verkleinern
-    max_width = 80  # gewünschte maximale Breite
-    aspect_ratio = logo.width / logo.height
-    new_width = min(logo.width, max_width)
-    new_height = int(new_width / aspect_ratio)
-    logo = logo.resize((new_width, new_height), Image.LANCZOS)
-    return logo
 
 def generate_image(data, output_path="sharepic.png"):
     # Schriftgrößen für Titel und temp_key
@@ -667,12 +657,6 @@ def generate_image(data, output_path="sharepic.png"):
     y = draw_block(draw, data["nicht_abgestimmt"], "NICHT ABGESTIMMT", y, COLOR_MAP["nicht_abgestimmt"], font_block, font_block2, font_block3, logos)
 
     img = img.crop((0, 0, img.width, y + 50))  # Bild kürzen
-
-    small_logo = load_small_logo()
-    logo_x = img.width - small_logo.width - 80  # 20 px Abstand zum rechten Rand
-    logo_y = img.height - small_logo.height - 10  # 20 px Abstand zum unteren Rand
-
-    img.paste(small_logo, (logo_x, logo_y), small_logo)
     img.save(output_path)
 
 
