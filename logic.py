@@ -1,19 +1,15 @@
 import requests
 from bs4 import BeautifulSoup
-import re
-import io
-import pdfplumber
 from collections import defaultdict
 import xml.etree.ElementTree as ET
-from collections import defaultdict
 import os
 import math
-from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
-import random
-from difflib import SequenceMatcher
-import traceback
-
+from typing import Optional, Tuple
+import europarl_api as ep
+import httpx
+from collections import OrderedDict
+BASE_URL = "https://data.europarl.europa.eu/api/v2"
 
 
 MAX_WIDTH = 70
@@ -77,268 +73,80 @@ PARTEI_ABKÜRZUNGEN = {
     'Partei des Fortschritts': 'PDF'
 }
 
-def read_website_text(url):
-    response = requests.get(url)
-
-    # Prüfen, ob die Seite erreichbar war
-    if response.status_code == 200:
-        # HTML parsen
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Skripte und Styles entfernen
-        for script_or_style in soup(['script', 'style']):
-            script_or_style.decompose()
-        
-        # Nur den reinen Text extrahieren
-        text = soup.get_text()
-        
-        # Zeilen säubern
-        lines = (line.strip() for line in text.splitlines())
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        clean_text = '\n'.join(chunk for chunk in chunks if chunk)
-        
-        return clean_text
-    else:
-        print(f"Fehler beim Abrufen der Seite: {response.status_code}")
-
-
-
-# Dein kompletter Text als String (z. B. aus Datei oder Web Scraping)
-
-def get_weeks_from_text(text):
-
-    # Regulärer Ausdruck, um Woche + Ort zu erfassen
-    pattern = re.compile(
-        r"((?:Monday|Tuesday|Wednesday|Thursday|Friday), \d{1,2} \w+ \d{4} - (?:Monday|Tuesday|Wednesday|Thursday|Friday), \d{1,2} \w+ \d{4})\n(Strasbourg|Brussels)"
-    )
-
-    # Alle passenden Tupel extrahieren: (Woche, Ort)
-    wochen = pattern.findall(text)
-
-    return wochen
-
-def tage_ausgeben(ausgewaehlte_woche, text):
-    pattern = re.compile(
-        re.escape(ausgewaehlte_woche)
-        + r"\n(Strasbourg|Brussels)\n(.*?)(?=\n(?:Monday|Tuesday|Wednesday|Thursday|Friday), \d{1,2} \w+ \d{4} -|$)",
-        re.DOTALL
-    )
-
-    match = pattern.search(text)
-
-    if not match:
-        print("Woche nicht gefunden.")
-        return []
-
-    wocheninhalt = match.group(2)
-
-    return re.findall(
-        r"(?:Monday|Tuesday|Wednesday|Thursday|Friday), \d{1,2} \w+ \d{4}",
-        wocheninhalt
-    )
-
-        
-
-        
-def pdf_finden(url, gesuchtes_datum):
-    # Seite laden und parsen
-    response = requests.get(url)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    # Datum finden
-    datum_tag = None
-    for tag in soup.find_all(string=gesuchtes_datum):
-        datum_tag = tag.parent
-        break
-
-    if not datum_tag:
-        print(f"Datum {gesuchtes_datum} nicht gefunden.")
-        return None
-
-    # Suche nach dem nächsten <ul>, darin nach .pdf-Links
-    next_ul = datum_tag.find_next_sibling("ul")
-    if next_ul:
-        pdf_link = None
-        for a_tag in next_ul.find_all("a", href=True):
-            if a_tag["href"].lower().endswith(".pdf"):
-                pdf_link = a_tag["href"]
-                break
-        for a_tag in next_ul.find_all("a", href=True):
-            if a_tag["href"].lower().endswith(".xml"):
-                xml_link = a_tag["href"]
-                break
-
-        if pdf_link:
-            print(f"Gefundener PDF-Link für {gesuchtes_datum}: {pdf_link}")
-            return pdf_link, xml_link
-        else:
-            print("Kein PDF-Link in der nächsten <ul>-Liste gefunden.")
-    else:
-        print("Kein <ul>-Element nach dem Datum gefunden.")
-
-    return None
-
-def read_pdf_with_pdfplumber(pdf_url):
-    response = requests.get(pdf_url)
-    response.raise_for_status()
-
-    all_text = []
-
-    with pdfplumber.open(io.BytesIO(response.content)) as pdf:
-        for i, page in enumerate(pdf.pages):
-            if i >= 15:
-                break
-            text = page.extract_text()
-            if text:  # Nur nicht-leere Seiten
-                all_text.append(text)
-
-    return "\n\n".join(all_text)
-    
-def clean_abstimmungstitel(text):
-    if not text:
-        return text
-
-    # + <Zahl> finden und alles dahinter entfernen
-    m = re.search(r"\+\s*\d+", text)
-    if m:
-        text = text[:m.start()].strip()
-
-    # Entferne alles ab P10_PV(2025) oder allgemein P<num>_PV(<year>)
-    m = re.search(r"P\d+_PV\(\d{4}\)", text)
-    if m:
-        text = text[:m.start()].strip()
-
-    # Entferne trailing Dokumentnummern wie "3 PE 776.102"
-    text = re.sub(r"\bPE\s*\d{3}\.\d{3}\b.*$", "", text).strip()
-
-    # Entferne trailing Abstimmungsnummern wie "RCV_EN 3"
-    text = re.sub(r"RCV_[A-Z]{2}\s*\d+.*$", "", text).strip()
-
-    # Doppelte Leerzeichen
-    text = re.sub(r"\s+", " ", text)
-
-    return text
-
-
-
-
-def parse_inhaltsverzeichnis(text):
-    struktur = defaultdict(list)
-    current_key = None
-    aktueller_unterpunkt = None
-    last = 0
-
-    lines = text.splitlines()
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        
-
-        # Entferne Punkte und Seitenzahlen am Ende
-        lin = re.sub(r'\.{3,}\s*\d+$', '', line).strip()
-        
-
-        # Hauptpunkt erkennen (z.B. "1. Some Title")
-        match_haupt = re.match(r'^(\d+)\.\s+(.*)$', lin)
-        if match_haupt:
-
-            nummer = int(match_haupt.group(1))
-
-            if nummer < last:
-                break
-            
-            last = nummer
-            titel = match_haupt.group(2).strip()
-            current_key = f"{nummer}. {titel}"
-            struktur[current_key] = []
-            aktueller_unterpunkt = None
-            continue
-
-        # Unterpunkt erkennen (z.B. "1.1 Subtitle")
-        match_unter = re.match(r'^(\d+\.\d+)\s+(.*)$', lin)
-        if match_unter and current_key:
-
-            unter_titel = f"{match_unter.group(1)} {match_unter.group(2).strip()}"
-            struktur[current_key].append(unter_titel)
-            aktueller_unterpunkt = len(struktur[current_key]) - 1  # Index merken
-        elif current_key is not None and aktueller_unterpunkt is not None:
-            # Zeile gehört zum vorherigen Unterpunkt → anhängen
-            struktur[current_key][aktueller_unterpunkt] += ' ' + lin
-
-    # Am Ende alles vollständig säubern
-    for key in list(struktur.keys()):
-        # Haupttitel säubern
-        clean_key = clean_abstimmungstitel(key)
-        
-        # Wenn sich der Key ändert, umbenennen
-        if clean_key != key:
-            struktur[clean_key] = struktur.pop(key)
-            key = clean_key
-
-        # Unterpunkte säubern
-        struktur[key] = [
-            clean_abstimmungstitel(unterpunkt)
-            for unterpunkt in struktur[key]
-        ]
-
-        
-
-    return dict(struktur)
-
-def parse_vote_results_from_url(xml_url):
-    response = requests.get(xml_url)
-    #response.raise_for_status()
-    xml_content = response.content
-
+def parse_vote_result(xml_content):
     root = ET.fromstring(xml_content)
-    results_dict = {}
 
-    for vote in root.findall(".//RollCallVote.Result"):
-        description = vote.findtext("RollCallVote.Description.Text")
-        if not description:
+    description = root.findtext("RollCallVote.Description.Text")
+
+    if not description:
+        description = ""
+
+    vote_result = defaultdict(list)
+
+    for result_type in ["For", "Against", "Abstention"]:
+        result_tag = root.find(f"./Result.{result_type}")
+
+        if result_tag is None:
             continue
-        description = description.strip()
-        vote_result = defaultdict(list)
 
-        for result_type in ['For', 'Against', 'Abstention']:
-            result_tag = vote.find(f"./Result.{result_type}")
-            if result_tag is not None:
-                for group in result_tag.findall("Result.PoliticalGroup.List"):
-                    for member in group.findall("PoliticalGroup.Member.Name"):
-                        name = member.text.strip()
-                        pers_id = member.attrib.get("PersId")
-                        vote_result[result_type].append({
-                            "name": name,
-                            "id": pers_id
-                        })
-                        
-        intentions = vote.find("Intentions")
-        if intentions is not None:
-            for intention_result_type in ['For', 'Against', 'Abstention']:
-                intention_tag = intentions.find(f"Intentions.Result.{intention_result_type}")
-                if intention_tag is not None:
-                    for member in intention_tag.findall("Member.Name"):
-                        name = member.text.strip()
-                        pers_id = member.attrib.get("PersId")
+        for group in result_tag.findall("Result.PoliticalGroup.List"):
+            group_id = group.attrib.get("Identifier")
 
-                        # Entferne aus allen bisherigen Kategorien
-                        for key in vote_result:
-                            vote_result[key] = [
-                                m for m in vote_result[key]
-                                if m["id"] != pers_id
-                            ]
+            for member in group.findall("PoliticalGroup.Member.Name"):
+                name = (member.text or "").strip()
+                pers_id = member.attrib.get("PersId")
+                mep_id = member.attrib.get("MepId")
 
-                        # Füge in neue Kategorie hinzu
-                        vote_result[intention_result_type].append({
-                            "name": name,
-                            "id": pers_id
-                        })
+                vote_result[result_type].append({
+                    "name": name,
+                    "id": pers_id,
+                    "mep_id": mep_id,
+                    "group": group_id
+                })
 
-        results_dict[description] = dict(vote_result)
+    # Sonderfälle / korrigierte Abstimmungsabsichten
+    intentions = root.find("Intentions")
 
-    return results_dict
+    if intentions is not None:
+        for intention_result_type in [
+            "For",
+            "Against",
+            "Abstention"
+        ]:
+            intention_tag = intentions.find(
+                f"Intentions.Result.{intention_result_type}"
+            )
+
+            if intention_tag is None:
+                continue
+
+            for member in intention_tag.findall("Member.Name"):
+                name = (member.text or "").strip()
+                pers_id = member.attrib.get("PersId")
+                mep_id = member.attrib.get("MepId")
+
+                # MEP aus allen bisherigen Kategorien entfernen
+                for key in vote_result:
+                    vote_result[key] = [
+                        m
+                        for m in vote_result[key]
+                        if m["id"] != pers_id
+                    ]
+
+                # MEP in die korrigierte Kategorie einfügen
+                vote_result[intention_result_type].append({
+                    "name": name,
+                    "id": pers_id,
+                    "mep_id": mep_id
+                })
+
+    return {
+        "identifier": root.attrib.get("Identifier"),
+        "dlv_id": root.attrib.get("DlvId"),
+        "date": root.attrib.get("Date"),
+        "description": description.strip(),
+        "results": dict(vote_result)
+    }
 
 def parse_meps_from_url(xml_url):
     response = requests.get(xml_url)
@@ -365,86 +173,48 @@ def parse_meps_from_url(xml_url):
 def normalize_partei(name):
     return PARTEI_ABKÜRZUNGEN.get(name, name)
 
-def find_best_matching_key(keys, query, threshold=0.3 ):
-    """
-    Sucht den ähnlichsten Key in einer Liste von Keys.
-    threshold = minimale Ähnlichkeit (0–1). 0.5 = 50% Match.
-    """
-    best_key = None
-    best_ratio = 0
+def verarbeite_deutsche_abstimmung(abstimmung, deutsche_meps, parteireihenfolge, titel):
 
-    for key in keys:
-        ratio = SequenceMatcher(None, key.lower(), query.lower()).ratio()
-        if ratio > best_ratio:
-            best_ratio = ratio
-            best_key = key
-
-    if best_ratio < threshold:
-        return None  # kein ausreichender Treffer
-    return best_key
-
-def verarbeite_deutsche_abstimmungen(abstimmungen, deutsche_meps, parteireihenfolge, punkt, abstimmungstitel):
     result = {
-        "titel_abstimmung": abstimmungstitel,
+        "titel_abstimmung": titel,
         "For": [],
         "Against": [],
         "Abstention": [],
         "not_voted": []
     }
 
-    fuzzy_used = False  # neue Variable, ob Fuzzy-Matching genutzt wurde
     gewertete_ids = set()
 
-    if punkt in abstimmungen:
-        temp_key = punkt
-    else:
-        print(f"⚠️ Direkter Treffer für '{punkt}' NICHT gefunden. Starte fuzzy matching...")
-        temp_key = find_best_matching_key(list(abstimmungen.keys()), punkt)
-        fuzzy_used = True  # <- Fuzzy wurde verwendet
+    # Die drei Abstimmungskategorien durchgehen
+    for entscheidung in ["For", "Against", "Abstention"]:
+        for abgeordneter in abstimmung.get("results", {}).get(entscheidung, []):
 
-        if temp_key is None:
-            raise KeyError(f"Keine passende Abstimmung für '{punkt}' gefunden – auch fuzzy nicht.")
-
-        print(f"👉 Fuzzy-Match gewählt: '{temp_key}'")
-
-    temp = abstimmungen[temp_key]
-
-    for entscheidung in temp.keys():
-        fraktion_list = temp[entscheidung]
-        for abgeordneter in fraktion_list:
             mep_id = abgeordneter.get("id")
-            if mep_id in deutsche_meps:
-                info = deutsche_meps[mep_id]
-                national_party = normalize_partei(info["national_political_group"])
 
-                parts = info["full_name"].split()
-                nachnamen_teile = [teil.capitalize() for teil in parts if teil.isupper()]
-                vornamen_teile = [teil.capitalize() for teil in parts if not teil.isupper()]
+            # Nur deutsche MEPs berücksichtigen
+            if mep_id not in deutsche_meps:
+                continue
 
-                if not nachnamen_teile:
-                    nachname = parts[-1]
-                    vorname = " ".join(parts[:-1])
-                else:
-                    nachname = " ".join(nachnamen_teile)
-                    vorname = " ".join(vornamen_teile)
+            info = deutsche_meps[mep_id]
 
-                if nachname == "Strack-zimmermann":
-                    nachname = "Strack-Zimmermann"
+            national_party = normalize_partei(
+                info["national_political_group"]
+            )
 
-                result[entscheidung].append({
-                    "name": nachname,
-                    "vorname": vorname,
-                    "partei": national_party,
-                    "political_group": info["political_group"]
-                })
-                gewertete_ids.add(mep_id)
-
-    for mep_id, info in deutsche_meps.items():
-        if mep_id not in gewertete_ids:
-            national_party = normalize_partei(info["national_political_group"])
+            # Vor- und Nachnamen bestimmen
             parts = info["full_name"].split()
-            nachnamen_teile = [teil.capitalize() for teil in parts if teil.isupper()]
-            vornamen_teile = [teil.capitalize() for teil in parts if not teil.isupper()]
+
+            nachnamen_teile = [
+                teil.capitalize()
+                for teil in parts
+                if teil.isupper()
+            ]
+
+            vornamen_teile = [
+                teil.capitalize()
+                for teil in parts
+                if not teil.isupper()
+            ]
 
             if not nachnamen_teile:
                 nachname = parts[-1]
@@ -454,29 +224,77 @@ def verarbeite_deutsche_abstimmungen(abstimmungen, deutsche_meps, parteireihenfo
                 vorname = " ".join(vornamen_teile)
 
             if nachname == "Strack-zimmermann":
-                nachname = "Strack-Zimmermann"  
+                nachname = "Strack-Zimmermann"
 
-            result['not_voted'].append({
+            result[entscheidung].append({
                 "name": nachname,
                 "vorname": vorname,
                 "partei": national_party,
                 "political_group": info["political_group"]
             })
 
+            gewertete_ids.add(mep_id)
+
+    # Deutsche MEPs bestimmen, die nicht in der Abstimmung vorkommen
+    for mep_id, info in deutsche_meps.items():
+
+        if mep_id in gewertete_ids:
+            continue
+
+        national_party = normalize_partei(
+            info["national_political_group"]
+        )
+
+        parts = info["full_name"].split()
+
+        nachnamen_teile = [
+            teil.capitalize()
+            for teil in parts
+            if teil.isupper()
+        ]
+
+        vornamen_teile = [
+            teil.capitalize()
+            for teil in parts
+            if not teil.isupper()
+        ]
+
+        if not nachnamen_teile:
+            nachname = parts[-1]
+            vorname = " ".join(parts[:-1])
+        else:
+            nachname = " ".join(nachnamen_teile)
+            vorname = " ".join(vornamen_teile)
+
+        if nachname == "Strack-zimmermann":
+            nachname = "Strack-Zimmermann"
+
+        result["not_voted"].append({
+            "name": nachname,
+            "vorname": vorname,
+            "partei": national_party,
+            "political_group": info["political_group"]
+        })
+
+    # Nach Partei und anschließend Nachname sortieren
     def sort_key(mep):
-        partei_index = parteireihenfolge.index(mep["partei"]) if mep["partei"] in parteireihenfolge else len(parteireihenfolge)
-        return (partei_index, mep["name"].lower())
+        partei_index = (
+            parteireihenfolge.index(mep["partei"])
+            if mep["partei"] in parteireihenfolge
+            else len(parteireihenfolge)
+        )
+
+        return (
+            partei_index,
+            mep["name"].lower()
+        )
 
     for entscheidung in ["For", "Against", "Abstention", "not_voted"]:
         result[entscheidung].sort(key=sort_key)
 
-    # temp_key und fuzzy_used zurückgeben
-    result['temp_key'] = temp_key
-    result['fuzzy_used'] = fuzzy_used
-
     return result
 
-def draw_block(draw, persons, label, y_offset, icon_color, font, font2, font3, logos):
+def draw_block(img, draw, persons, label, y_offset, icon_color, font, font2, font3, logos):
     draw.rectangle([PADDING, y_offset - 2, PADDING + 10, y_offset + ICON_SIZE ], fill=icon_color)
     draw.text((PADDING + REC_SIZE + 13, y_offset), label, fill=icon_color, font=font2)
     
@@ -575,99 +393,251 @@ def wrap_text(text, font, max_width, draw):
 
     return lines
 
+def generate_image(data, output_path="sharepic.png", format="square"):
+    # ---------------------------------------------------------
+    # Bildformat bestimmen
+    # ---------------------------------------------------------
 
-def generate_image(data, output_path="sharepic.png"):
-    # Schriftgrößen für Titel und temp_key
- 
+    if format == "square":
+        width = 1200
+        estimated_height = 1200
+
+    elif format == "portrait":
+        width = 1200
+        estimated_height = 1500
+
+    else:
+        raise ValueError(
+            f"Unbekanntes Format: {format}"
+        )
+
+    # ---------------------------------------------------------
+    # Schriftgrößen
+    # ---------------------------------------------------------
+
     size_temp = 28
 
-    font_temp = ImageFont.truetype(FONT_PATH, size_temp)
-
-    # Blöcke verwenden weiterhin die bisherigen Fonts
     try:
-        font_temp = ImageFont.truetype(FONT_PATH, 28)
-        font_block = ImageFont.truetype(FONT_PATH, FONT_SIZE)
-        font_block2 = ImageFont.truetype(FONT2, round(FONT_SIZE*0.9))
-        font_block3 = ImageFont.truetype(FONT_PATH, round(FONT_SIZE*0.8))
-        font_title = ImageFont.truetype(FONT2, 42)
+        font_temp = ImageFont.truetype(
+            FONT_PATH,
+            size_temp
+        )
+
+        font_block = ImageFont.truetype(
+            FONT_PATH,
+            FONT_SIZE
+        )
+
+        font_block2 = ImageFont.truetype(
+            FONT2,
+            round(FONT_SIZE * 0.9)
+        )
+
+        font_block3 = ImageFont.truetype(
+            FONT_PATH,
+            round(FONT_SIZE * 0.8)
+        )
+
+        font_title = ImageFont.truetype(
+            FONT2,
+            42
+        )
+
     except Exception as e:
         print(f"Font loading error: {e}")
         print(f"BASE_DIR: {BASE_DIR}")
-        print(f"FONT_PATH exists: {os.path.exists(FONT_PATH)}")
+        print(
+            f"FONT_PATH exists: "
+            f"{os.path.exists(FONT_PATH)}"
+        )
         raise
+
+    # ---------------------------------------------------------
+    # Logos
+    # ---------------------------------------------------------
+
     logos = load_logos()
 
-    estimated_height = 1500
-    global img
-    img = Image.new("RGBA", (1200, estimated_height), "white")
+    # ---------------------------------------------------------
+    # Bild erzeugen
+    # ---------------------------------------------------------
+
+    img = Image.new(
+        "RGBA",
+        (width, estimated_height),
+        "white"
+    )
+
     draw = ImageDraw.Draw(img)
 
-    # --- temp_key über dem Bild ---
-    y_offset = 20  # Abstand vom oberen Rand
-    '''
-    temp_key_text = data.get("temp_key", "")
-    fuzzy = data.get("fuzzy_used", False)
+    # ---------------------------------------------------------
+    # Überschrift
+    # ---------------------------------------------------------
 
-
-    if temp_key_text:
-        display_text = f"Selected vote: {temp_key_text}"
-        fill_color = "red" if fuzzy else "black"
-        if fuzzy:
-            display_text += " (Please double check, whether the program chose the right title)"
-
-
-    wrapped_temp = wrap_text(display_text, font_temp, img.width - 2 * 20, draw)
-    for line in wrapped_temp:
-        bbox = draw.textbbox((0,0), line, font=font_temp)
-        line_width = bbox[2] - bbox[0]
-        x = (img.width - line_width) // 2  # zentriert
-        draw.text((x, y_offset), line, fill=fill_color, font=font_temp)
-        y_offset += 30  # Zeilenhöhe
-    '''
-
-
-    # --- Überschrift des Bildes ---
     title = data.get("title", "")
-    wrapped_lines = wrap_text(title, font_title, img.width - 2 * 20, draw)
-    y = y_offset + 20  # Abstand zum temp_key-Text
-    for line in wrapped_lines:
-        bbox = draw.textbbox((0, 0), line, font=font_title)
-        line_width = bbox[2] - bbox[0]
-        x = (img.width - line_width) // 2
-        draw.text((x, y), line, fill="black", font=font_title)  # Titel in Standard-Font (kann kursiv simuliert werden)
-        y += 35  # Zeilenhöhe
 
-    y += 20  # Extra Abstand zwischen Titel und Blöcken
+    y = 40
 
-    # --- Blöcke zeichnen ---
-    y = draw_block(draw, data["ja"], "DAFÜR", y, COLOR_MAP["ja"], font_block, font_block2, font_block3, logos)
-    y = draw_block(draw, data["nein"], "DAGEGEN", y, COLOR_MAP["nein"], font_block, font_block2, font_block3, logos)
-    y = draw_block(draw, data["enthaltung"], "ENTHALTEN", y, COLOR_MAP["enthaltung"], font_block, font_block2, font_block3, logos)
-    y = draw_block(draw, data["nicht_abgestimmt"], "NICHT ABGESTIMMT", y, COLOR_MAP["nicht_abgestimmt"], font_block, font_block2, font_block3, logos)
+    if title.strip():
+        wrapped_lines = wrap_text(
+            title,
+            font_title,
+            img.width - 80,
+            draw
+        )
 
-    img = img.crop((0, 0, img.width, y + 50))  # Bild kürzen
-    logo_path = os.path.join(LOGO_PATH, "GreensEFA.png")
+        for line in wrapped_lines:
+            bbox = draw.textbbox(
+                (0, 0),
+                line,
+                font=font_title
+            )
+
+            line_width = bbox[2] - bbox[0]
+
+            x = (
+                img.width - line_width
+            ) // 2
+
+            draw.text(
+                (x, y),
+                line,
+                fill="black",
+                font=font_title
+            )
+
+            y += 50
+
+        # zusätzlicher Abstand
+        # zwischen Überschrift und erstem Block
+        y += 45
+
+    else:
+        # Wenn kein Titel vorhanden ist,
+        # trotzdem etwas Abstand oben lassen
+        y += 20
+
+    # ---------------------------------------------------------
+    # Abstimmungsblöcke
+    # ---------------------------------------------------------
+
+    y = draw_block(
+        img,
+        draw,
+        data["ja"],
+        "DAFÜR",
+        y,
+        COLOR_MAP["ja"],
+        font_block,
+        font_block2,
+        font_block3,
+        logos
+    )
+
+    y = draw_block(
+        img,
+        draw,
+        data["nein"],
+        "DAGEGEN",
+        y,
+        COLOR_MAP["nein"],
+        font_block,
+        font_block2,
+        font_block3,
+        logos
+    )
+
+    y = draw_block(
+        img,
+        draw,
+        data["enthaltung"],
+        "ENTHALTEN",
+        y,
+        COLOR_MAP["enthaltung"],
+        font_block,
+        font_block2,
+        font_block3,
+        logos
+    )
+
+    y = draw_block(
+        img,
+        draw,
+        data["nicht_abgestimmt"],
+        "NICHT ABGESTIMMT",
+        y,
+        COLOR_MAP["nicht_abgestimmt"],
+        font_block,
+        font_block2,
+        font_block3,
+        logos
+    )
+
+    # ---------------------------------------------------------
+    # Bild beschneiden
+    # ---------------------------------------------------------
+
+    img = img.crop(
+        (0, 0, img.width, y + 50)
+    )
+
+    # ---------------------------------------------------------
+    # GreensEFA Logo unten rechts
+    # ---------------------------------------------------------
+
+    logo_path = os.path.join(
+        LOGO_PATH,
+        "GreensEFA.png"
+    )
+
     if os.path.exists(logo_path):
-        bottom_logo = Image.open(logo_path).convert("RGBA")
-        
-        # Größe anpassen (z.B. 100px breit)
+
+        bottom_logo = Image.open(
+            logo_path
+        ).convert("RGBA")
+
         logo_width = 100
-        aspect_ratio = bottom_logo.height / bottom_logo.width
-        logo_height = int(logo_width * aspect_ratio)
-        bottom_logo = bottom_logo.resize((logo_width, logo_height), Image.LANCZOS)
-        
-        # Position: unten rechts mit 20px Abstand
-        x_pos = img.width - logo_width - 80
-        y_pos = img.height - logo_height - 18
-        
-        img.paste(bottom_logo, (x_pos, y_pos), bottom_logo)
 
+        aspect_ratio = (
+            bottom_logo.height
+            / bottom_logo.width
+        )
 
-    
+        logo_height = int(
+            logo_width * aspect_ratio
+        )
+
+        bottom_logo = bottom_logo.resize(
+            (
+                logo_width,
+                logo_height
+            ),
+            Image.LANCZOS
+        )
+
+        x_pos = (
+            img.width
+            - logo_width
+            - 80
+        )
+
+        y_pos = (
+            img.height
+            - logo_height
+            - 18
+        )
+
+        img.paste(
+            bottom_logo,
+            (x_pos, y_pos),
+            bottom_logo
+        )
+
+    # ---------------------------------------------------------
+    # Speichern
+    # ---------------------------------------------------------
+
     img.save(output_path)
-
-
-
 
 def übersetze_keys(abstimmungs_dict):
     key_mapping = {
@@ -682,58 +652,252 @@ def übersetze_keys(abstimmungs_dict):
         key_mapping.get(k, k): v for k, v in abstimmungs_dict.items()
     }
 
-def parse_inhaltsverzeichnis_from_xml(xml_url):
-    """
-    Liest alle Abstimmungstitel (description texts) aus der XML-Datei
-    und gibt sie als geordnetes Inhaltsverzeichnis zurück.
-    """
+async def parse_rcv_inhaltsverzeichnis(url: str, date: str):
+    ###
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.get(url)
+        response.raise_for_status()
 
-    response = requests.get(xml_url)
-    response.raise_for_status()
-    xml_content = response.content
-    root = ET.fromstring(xml_content)
+    root = ET.fromstring(response.text)
 
-    inhaltsverzeichnis = []
-    for vote in root.findall(".//RollCallVote.Result"):
-        description = vote.findtext("RollCallVote.Description.Text")
-        if description:
-            description = description.strip()
-            inhaltsverzeichnis.append(description)
+    # =========================================================
+    # 2. Vote-Results des Tages aus der API laden
+    # =========================================================
 
-    return inhaltsverzeichnis
+    sitting_id = f"MTG-PL-{date}"
 
-def process_abstimmung(punkt, tag, titel):
-    # Holt Daten
-    xml_link = pdf_finden(url, tag)[1]
-    vote_results = parse_vote_results_from_url(xml_link)
-    mep_link = "https://www.europarl.europa.eu/meps/de/download/advanced/xml?countryCode=DE"
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.get(
+            f"{BASE_URL}/meetings/{sitting_id}/vote-results",
+            headers={
+                "Accept": "application/ld+json"
+            }
+        )
+
+        response.raise_for_status()
+
+    vote_results = response.json()["data"]
+
+    # =========================================================
+    # 3. DlvId -> API-Vote
+    # =========================================================
+
+    vote_by_dlv_id = {
+        vote.get("notation_dlvId"): vote
+        for vote in vote_results
+        if vote.get("notation_dlvId")
+    }
+
+    # =========================================================
+    # 4. RCVs aus XML gruppieren
+    # =========================================================
+
+    abstimmungen = OrderedDict()
+
+    for result in root.iter("RollCallVote.Result"):
+
+        dlv_id = result.attrib.get("DlvId")
+        identifier = result.attrib.get("Identifier")
+        result_date = result.attrib.get("Date")
+
+        description = result.findtext(
+            "RollCallVote.Description.Text",
+            default=""
+        ).strip()
+
+        if not dlv_id or not description:
+            continue
+
+        # -----------------------------------------------------
+        # Abstimmungsobjekt erstmalig anlegen
+        # -----------------------------------------------------
+
+        if dlv_id not in abstimmungen:
+
+            api_vote = vote_by_dlv_id.get(dlv_id)
+
+            titel = None
+            vote_id = None
+            dokument_id = None
+
+            if api_vote:
+
+                vote_id = api_vote.get("activity_id")
+
+                # Zugehöriges Dokument
+                references = api_vote.get(
+                    "based_on_a_realization_of",
+                    []
+                )
+
+                if references:
+                    dokument_id = references[0].split("/")[-1]
+
+                # Titel des übergeordneten Abstimmungsobjekts
+                #
+                # Wir verwenden dafür den activity_label
+                # des Vote-Results, NICHT den RCV-Description-Text.
+                titel = (
+                    api_vote.get("activity_label", {})
+                    .get("de")
+                )
+
+            # Fallback, falls API keinen Titel liefert
+            if not titel:
+                titel = description.split(" – ")[0].strip()
+
+            abstimmungen[dlv_id] = {
+                "titel": titel,
+                "dlv_id": dlv_id,
+                "vote_id": vote_id,
+                "dokument_id": dokument_id,
+                "unterabstimmungen": []
+            }
+
+        # -----------------------------------------------------
+        # Unterabstimmung hinzufügen
+        # -----------------------------------------------------
+
+        abstimmungen[dlv_id]["unterabstimmungen"].append({
+            "titel": description,
+            "identifier": identifier,
+            "date": result_date
+        })
+
+    # =========================================================
+    # 5. Liste zurückgeben
+    # =========================================================
+
+    return list(abstimmungen.values())
+
+async def process_abstimmung(identifier, tag, titel, format):
+    ###
+    # RCV anhand des Identifiers holen
+    xml_content = await ep.fetch_rcv_result(
+        identifier,
+        tag
+    )
+
+    if not xml_content:
+        raise ValueError(
+            f"Keine Abstimmung mit Identifier {identifier} gefunden."
+        )
+
+    vote_results = parse_vote_result(xml_content)
+
+    mep_link = (
+        "https://www.europarl.europa.eu/"
+        "meps/de/download/advanced/xml?countryCode=DE"
+    )
+
     mep_dict = parse_meps_from_url(mep_link)
 
-    s = re.sub(r'^\d+\.\d+\s+', '', punkt)
-
-    ergebnis = verarbeite_deutsche_abstimmungen(
-        abstimmungen=vote_results,
+    ergebnis = verarbeite_deutsche_abstimmung(
+        abstimmung=vote_results,
         deutsche_meps=mep_dict,
         parteireihenfolge=parteireihenfolge,
-        punkt=s.strip(),
-        abstimmungstitel=titel.strip()
+        titel=titel
     )
 
     auswertung = übersetze_keys(ergebnis)
 
-    # temp_key und fuzzy_used ebenfalls weitergeben
-    auswertung['temp_key'] = ergebnis['temp_key']
-    auswertung['fuzzy_used'] = ergebnis['fuzzy_used']
+    generate_image(
+        auswertung,
+        "sharepic.png",
+        format=format
+    )
 
-    # Bild erzeugen
-    generate_image(auswertung, "sharepic.png")
     return "sharepic.png"
 
+def parse_rcv_inhaltsverzeichnis_xml(xml_content: bytes):
+    """
+    Liest eine hochgeladene RCV-XML-Datei und gruppiert
+    alle RollCallVote.Result nach DlvId.
+    """
 
+    root = ET.fromstring(xml_content)
 
-    
+    abstimmungen = OrderedDict()
 
-    
+    for result in root.iter("RollCallVote.Result"):
 
+        dlv_id = result.attrib.get("DlvId")
+        identifier = result.attrib.get("Identifier")
+        result_date = result.attrib.get("Date")
 
+        description = result.findtext(
+            "RollCallVote.Description.Text",
+            default=""
+        ).strip()
 
+        if not dlv_id or not description:
+            continue
+
+        # Titel des übergeordneten Abstimmungsobjekts
+        titel = description.split(" – ")[0].strip()
+
+        if dlv_id not in abstimmungen:
+            abstimmungen[dlv_id] = {
+                "titel": titel,
+                "dlv_id": dlv_id,
+                "unterabstimmungen": []
+            }
+
+        abstimmungen[dlv_id]["unterabstimmungen"].append({
+            "titel": description,
+            "identifier": identifier,
+            "date": result_date
+        })
+
+    return list(abstimmungen.values())
+
+async def process_abstimmung_from_xml(
+    identifier,
+    xml_content,
+    titel,
+    format="square"
+):
+    # Gewünschtes RCV aus der hochgeladenen XML suchen
+    root = ET.fromstring(xml_content)
+
+    xml_result = None
+
+    for result in root.iter("RollCallVote.Result"):
+        if result.attrib.get("Identifier") == str(identifier):
+            xml_result = ET.tostring(
+                result,
+                encoding="unicode"
+            )
+            break
+
+    if not xml_result:
+        raise ValueError(
+            f"Keine Abstimmung mit Identifier "
+            f"{identifier} in der XML gefunden."
+        )
+
+    vote_results = parse_vote_result(xml_result)
+
+    mep_link = (
+        "https://www.europarl.europa.eu/"
+        "meps/de/download/advanced/xml?countryCode=DE"
+    )
+
+    mep_dict = parse_meps_from_url(mep_link)
+
+    ergebnis = verarbeite_deutsche_abstimmung(
+        abstimmung=vote_results,
+        deutsche_meps=mep_dict,
+        parteireihenfolge=parteireihenfolge,
+        titel=titel
+    )
+
+    auswertung = übersetze_keys(ergebnis)
+
+    generate_image(
+        auswertung,
+        "sharepic.png",
+        format=format
+    )
+
+    return "sharepic.png"
